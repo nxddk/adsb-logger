@@ -1,0 +1,54 @@
+services:
+  logger:
+    build:
+      context: .
+      target: runtime
+    environment:
+      LOG_DIR: /data
+      INTERVAL_SECONDS: ${INTERVAL_SECONDS:-30}
+      MQTT_HOST: ${MQTT_HOST:-mqtt}
+      MQTT_PORT: ${MQTT_PORT:-1883}
+      MQTT_TOPIC_PREFIX: ${MQTT_TOPIC_PREFIX:-adsb-logger}
+      MQTT_CLIENT_ID: ${MQTT_CLIENT_ID:-}
+      MQTT_USERNAME: ${MQTT_USERNAME:-}
+      MQTT_PASSWORD: ${MQTT_PASSWORD:-}
+      MQTT_TLS: ${MQTT_TLS:-false}
+      MQTT_CA: ${MQTT_CA:-}
+      OPENSKY_CLIENT_ID: ${OPENSKY_CLIENT_ID:-}
+      OPENSKY_CLIENT_SECRET: ${OPENSKY_CLIENT_SECRET:-}
+      LOGGER_UID: ${LOGGER_UID:-1000}
+      LOGGER_GID: ${LOGGER_GID:-1000}
+      LOG_VERBOSE: ${LOG_VERBOSE:-false}
+    volumes:
+      - type: bind
+        source: ${LOG_DIR:-./data}
+        target: /data
+        bind:
+          create_host_path: false
+    depends_on:
+      mqtt:
+        condition: service_healthy
+    restart: unless-stopped
+    stop_grace_period: 2m
+
+  mqtt:
+    image: eclipse-mosquitto:2
+    ports:
+      - "${MQTT_BIND_ADDRESS:-127.0.0.1}:${MQTT_PUBLISHED_PORT:-1883}:1883"
+    volumes:
+      - ./mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "mosquitto_pub", "-h", "127.0.0.1", "-t", "__health/mqtt", "-n"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+
+  tests:
+    profiles: ["test"]
+    build:
+      context: .
+      target: test
+    environment:
+      MQTT_TEST_HOST: mqtt

@@ -1,0 +1,13 @@
+# Only package sources, container startup, and tests belong in the build context.
+# In particular, never send .env credentials or recordings to the Docker builder.
+**
+!pyproject.toml
+!README.md
+!src/
+!src/**
+!docker/
+!docker/entrypoint.sh
+!tests/
+!tests/**
+**/__pycache__/
+**/*.py[cod]
