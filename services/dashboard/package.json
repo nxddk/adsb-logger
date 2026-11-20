@@ -1,5 +1,5 @@
 {
-  "name": "adsb-logger-dashboard",
+  "name": "@argus-stack/dashboard",
   "private": true,
   "type": "module",
   "scripts": {

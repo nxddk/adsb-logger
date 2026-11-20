@@ -1,210 +1,154 @@
-# ADS-B logger
+# Argus Stack
 
-A small Python service that records live [OpenSky aircraft state snapshots](https://openskynetwork.github.io/opensky-api/rest.html), controlled over MQTT or a Nuxt web dashboard. Docker Compose runs the logger, its Mosquitto MQTT broker, and the dashboard. It starts **idle**, supports one recording at a time, and polls every 30 seconds by default.
+A Docker Compose workspace for independently packaged services. The current stack includes an MQTT broker, a Nuxt dashboard, and a Python service that records aircraft state snapshots from the OpenSky REST API. Add new services under `services/` and register them in the root Compose file.
 
-## Install and run
+## Run the stack
 
-Requires Docker Engine and Docker Compose. No host Python or Node installation is needed. From this repository:
+Requires Docker Engine and Docker Compose. Python and Node are supplied by the containers.
 
 ```sh
-cp .env.example .env
-# Edit .env to set the recording directory, credentials, and other settings.
+# From the repository root; keep an existing .env:
+test -f .env || cp .env.example .env
+# Edit .env as needed.
 docker compose up -d --build
-docker compose logs -f logger
+docker compose logs -f
 ```
 
-Open **http://localhost:3000** for the dashboard. Set the capture area's south/north latitude, west/east longitude, and polling interval, then choose **Start recording**. **Stop** closes the session file. The dashboard shows live service availability, snapshot and aircraft-observation counts, active area, output path, and API errors. **Refresh status** requests a fresh update from the logger.
+Open **http://localhost:3000**. The ADS-B recorder starts idle. Paste an area's bounding box as `west,south,east,north` (for example `-73.617067,45.471297,-73.576427,45.489201`), set the polling interval, then use **Start recording**, **Stop**, or **Refresh status**. The dashboard shows service availability, recording counts, output paths, and API errors.
 
-The dashboard connects to MQTT on the server; broker credentials are never sent to the browser. Its automatic two-second status refresh reads the server's MQTT cache and does not make extra OpenSky requests. Commands wait for a matching acknowledgement from the logger, which can be delayed by an in-flight API request. Offline controls are disabled, and retained status is shown as the last reported state while disconnected.
-
-`DASHBOARD_PORT` changes the dashboard's host port. By default it binds to `127.0.0.1`. To reach a Raspberry Pi from another machine on a trusted LAN, set `DASHBOARD_BIND_ADDRESS=0.0.0.0` in `.env` and open `http://<pi-address>:3000`. The dashboard has no login and grants recording controls to anyone who can reach it. Broker access can remain bound to loopback because the dashboard talks to it over the Docker network.
-
-Compose reads `.env` automatically and supplies configuration to the services. It waits for the broker health check before starting the logger and dashboard, and all three services restart with Docker unless explicitly stopped. After editing `.env`, run `docker compose up -d` again to apply changes; `docker compose restart` alone does not reload environment variables. Rebuild with `--build` after changing source files.
-
-Recordings go to `LOG_DIR` on the **host**, defaulting to this repo's `./data` folder (included as an empty directory; recordings are gitignored). Set `LOG_DIR=/path/to/recordings` in `.env` to choose another location, and create that host directory before starting Compose. The mount requires an existing directory so a missing or mistyped path fails instead of silently putting recordings elsewhere. Inside the logger container this folder is always `/data`, so MQTT status reports paths such as `/data/SESSION.jsonl`. Every session gets a unique file; recordings survive container restarts, rebuilds, and `docker compose down`.
-
-On Linux, set `LOGGER_UID` and `LOGGER_GID` in `.env` to your user's numeric IDs (`id -u` and `id -g`) if they differ from 1000. Startup sets ownership of the recording directory to those IDs, then runs Python as that user. Existing recording files are not recursively changed.
-
-Stop the stack with `docker compose down`. Compose stops the logger before the broker, allowing it to close its current recording and publish offline status. It allows up to two minutes for an in-flight request to finish. Restarting the logger returns it to idle; recording does not resume automatically.
-
-An MQTT broker routes messages: controllers publish commands to a topic, the logger subscribes to it, and the broker delivers those messages. The logger publishes status through the same broker. Inside Docker, the logger connects to the `mqtt` service on port 1883. The broker also exposes port 1883 on host `127.0.0.1` by default. The bundled broker has no authentication; keep the default loopback binding for local access. For controllers on other machines, use an authenticated external broker or configure Mosquitto authentication before exposing its listener.
-
-The Docker images support ARM64, including 64-bit Raspberry Pi OS, and AMD64. No platform emulation is needed on those systems.
-
-## Send commands
-
-These commands use the MQTT tools inside the included broker container, so no additional client installation is needed. They assume the default `MQTT_TOPIC_PREFIX=adsb-logger`; replace the topic prefix if you change it in `.env`.
-
-Watch status and command responses:
+If upgrading an existing checkout, see [Migrating from the previous layout](#migrating-from-the-previous-layout) before starting the renamed stack.
 
 ```sh
-docker compose exec mqtt mosquitto_sub -h localhost -t 'adsb-logger/#' -v
+docker compose ps                        # Service state
+docker compose logs -f adsb-logger        # Recorder logs
+docker compose up -d --build dashboard    # Rebuild one service
+docker compose down                      # Stop the stack; keep recordings
 ```
 
-Start a recording around Toronto (WGS84 coordinates in decimal degrees):
+The Compose project is named `argus-stack`, regardless of the checkout directory's name. Docker's standard `-p` / `COMPOSE_PROJECT_NAME` overrides are available for additional isolated stacks.
 
-```sh
-docker compose exec mqtt mosquitto_pub -h localhost -q 1 \
-  -t adsb-logger/command \
-  -m '{"command":"start","request_id":"toronto-1","bbox":{"lamin":43,"lomin":-80.5,"lamax":44.5,"lomax":-78.5},"interval_seconds":30}'
-```
+## Services
 
-Stop recording, leaving the service available for another start:
-
-```sh
-docker compose exec mqtt mosquitto_pub -h localhost -q 1 \
-  -t adsb-logger/command -m '{"command":"stop","request_id":"stop-1"}'
-```
-
-Request the current status:
-
-```sh
-docker compose exec mqtt mosquitto_pub -h localhost -q 1 \
-  -t adsb-logger/command -m '{"command":"status"}'
-```
-
-With an existing broker, use any MQTT client to publish the same JSON payloads to `<prefix>/command`.
-
-| Command | Parameters | Behavior |
+| Compose service | Location | Responsibility |
 | --- | --- | --- |
-| `start` | Required `bbox` object; optional `interval_seconds` | Create a session and poll immediately. Rejected if already recording. |
-| `stop` | None | Close the recording; succeeds if already idle. |
-| `status` | None | Publish the current status. |
+| `mqtt` | [services/mqtt](services/mqtt/README.md) | Shared Mosquitto MQTT broker and configuration |
+| `dashboard` | [services/dashboard](services/dashboard/README.md) | Nuxt UI and server-side MQTT bridge |
+| `adsb-logger` | [services/adsb-logger](services/adsb-logger/README.md) | OpenSky polling, recording sessions, JSON Lines output |
 
-`bbox` requires exactly `lamin`, `lomin`, `lamax`, `lomax`, with increasing latitude bounds within -90..90 and longitude bounds within -180..180. Boxes crossing the antimeridian are unsupported. Intervals must be finite numbers >= 10 seconds; an omitted interval uses the service default.
-
-Every command can include an optional `request_id` (1–128 characters). The service remembers the last 128 IDs in memory: retransmitting the same command returns its original response without applying the action again. Reusing an ID for a different command is rejected. Use a new ID for each new action. This cache does not survive service restarts.
-
-Publish commands **without retain** (do not add `mosquitto_pub -r`). Retained commands delivered when subscribing/reconnecting are ignored to prevent stale starts or stops. MQTT 3.1.1 does not expose the publisher's retain flag for messages delivered to an existing subscriber, so publishers must follow this rule.
-
-| Topic (default prefix) | Contents |
-| --- | --- |
-| `adsb-logger/command` | Input JSON commands; subscribe/publish with QoS 1 |
-| `adsb-logger/response` | JSON `{ "ok": true, "request_id": "…", "status": {…} }` or `{ "ok": false, "request_id": "…", "error": "…" }`; not retained |
-| `adsb-logger/status` | Retained JSON with `state` (`idle` or `recording`), file path, session ID, bbox, interval, snapshot/observation counts, last error and retry delay |
-| `adsb-logger/availability` | Retained `online` / `offline`; an MQTT last will marks an unexpected disconnect |
-
-Status updates follow commands, polls, and reconnections. Check availability before treating retained status as current. An MQTT outage does not interrupt an active recording; the client reconnects automatically and republishes current status. Commands sent while disconnected are not saved for later, and command responses are not durable. Service restarts always return to idle.
-
-## Credentials and connection settings
-
-All deployment parameters are listed in [.env.example](.env.example). OpenSky supports anonymous access and optional OAuth2 API client credentials. Create an API client in your [OpenSky account](https://opensky-network.org/my-opensky/account) and set both values in `.env` to enable authentication:
-
-```dotenv
-OPENSKY_CLIENT_ID=your-api-client-id
-OPENSKY_CLIENT_SECRET='your-client-secret'
+```text
+argus-stack/
+├── compose.yaml                 # Service wiring, networking, mounts, and health checks
+├── .env.example                 # Shared deployment configuration
+├── data/                        # Existing ADS-B recordings; gitignored
+└── services/
+    ├── mqtt/
+    │   ├── mosquitto.conf
+    │   └── README.md
+    ├── dashboard/
+    │   ├── Dockerfile
+    │   ├── package.json
+    │   ├── app/, server/, shared/, tests/
+    │   └── README.md
+    └── adsb-logger/
+        ├── Dockerfile
+        ├── pyproject.toml
+        ├── src/adsb_logger/
+        ├── tests/
+        ├── docker/entrypoint.sh
+        └── README.md
 ```
 
-Tokens refresh automatically before expiry and once on a 401 response. Website username/password authentication is not supported by OpenSky.
+The root manages deployment; application dependencies, source, tests, and image definitions belong to their service. The ADS-B Python package remains independently installable as `adsb-logger`, with the same `adsb-logger` command and `adsb_logger` import. The broker uses its upstream image directly.
 
-For an authenticated external MQTT broker, use its reachable hostname (not `localhost`, which refers to the logger container):
+MQTT connects services on the Compose network. Both applications use the shared connection settings, while the recorder's command namespace remains `adsb-logger` by default. Other services can use separate namespaces on the same broker. The dashboard keeps broker credentials on its server; browser status polling does not consume OpenSky credits.
 
-```dotenv
-MQTT_HOST=broker.example.com
-MQTT_PORT=8883
-MQTT_USERNAME=logger
-MQTT_PASSWORD='your-password'
-MQTT_TLS=true
-MQTT_TOPIC_PREFIX=aircraft/logger
-```
+## Configuration
 
-Then run `docker compose up -d --build --no-deps logger dashboard` to start the logger and dashboard without the bundled broker. If you previously ran the bundled broker, stop it with `docker compose stop mqtt`. Setting MQTT credentials configures client connections; it does not configure authentication on the bundled broker. The dashboard uses its own generated MQTT client ID to avoid disconnecting the logger.
+Compose reads the root `.env` automatically. Existing environment variable names and values are supported; no credential migration is needed. After editing `.env`, run `docker compose up -d` to recreate affected containers. `docker compose restart` alone does not reload configuration. Exported shell variables take precedence over `.env` values.
 
-`MQTT_TLS=true` uses verified TLS with system CA certificates. For a private CA, set `MQTT_CA=/certs/ca.pem` and add a read-only certificate bind mount to **both** `logger` and `dashboard` in a `compose.override.yaml` file. The port remains 1883 unless explicitly changed. Use a separate topic prefix for each logger instance.
-
-| `.env` setting | Meaning | Default |
+| Setting | Used by | Default / meaning |
 | --- | --- | --- |
-| `LOG_DIR` | Host directory mounted at `/data` | `./data` |
-| `INTERVAL_SECONDS` | Default polling interval, >= 10 seconds | `30` |
-| `DASHBOARD_BIND_ADDRESS`, `DASHBOARD_PORT` | Host interface and port for the web dashboard | `127.0.0.1`, `3000` |
-| `LOGGER_UID`, `LOGGER_GID` | Numeric user/group for Python and recording ownership | `1000` |
-| `MQTT_HOST`, `MQTT_PORT` | Broker address from inside the logger container | `mqtt`, `1883` |
-| `MQTT_TOPIC_PREFIX` | Topic prefix for commands and status | `adsb-logger` |
-| `MQTT_CLIENT_ID` | MQTT client identifier | Automatically assigned |
-| `MQTT_BIND_ADDRESS` | Host interface for the bundled broker | `127.0.0.1` |
-| `MQTT_PUBLISHED_PORT` | Host port for the bundled broker; internal port stays 1883 | `1883` |
-| `MQTT_USERNAME`, `MQTT_PASSWORD` | Optional broker credentials | Empty |
-| `MQTT_TLS`, `MQTT_CA` | Verified TLS and optional CA path inside the container | `false`, empty |
-| `OPENSKY_CLIENT_ID`, `OPENSKY_CLIENT_SECRET` | Optional OAuth credentials; set both or neither | Empty |
-| `LOG_VERBOSE` | Debug logging | `false` |
+| `MQTT_HOST`, `MQTT_PORT` | Dashboard, ADS-B | `mqtt`, `1883` on the Docker network |
+| `MQTT_USERNAME`, `MQTT_PASSWORD` | Dashboard, ADS-B | Optional broker client credentials |
+| `MQTT_TLS`, `MQTT_CA` | Dashboard, ADS-B | `false`; optional CA path inside each container |
+| `MQTT_TOPIC_PREFIX` | Dashboard, ADS-B | `adsb-logger`; recorder controls/status namespace |
+| `MQTT_CLIENT_ID` | ADS-B | Empty for an automatically assigned client ID |
+| `MQTT_BIND_ADDRESS`, `MQTT_PUBLISHED_PORT` | Broker | Host listener `127.0.0.1:1883` |
+| `DASHBOARD_BIND_ADDRESS`, `DASHBOARD_PORT` | Dashboard | Host listener `127.0.0.1:3000` |
+| `LOG_DIR` | ADS-B | Existing host recording directory, default `./data` |
+| `INTERVAL_SECONDS` | ADS-B, dashboard form | Default polling interval, `30` seconds |
+| `OPENSKY_CLIENT_ID`, `OPENSKY_CLIENT_SECRET` | ADS-B | Optional OAuth API client credentials; set both or neither |
+| `LOGGER_UID`, `LOGGER_GID` | ADS-B | Recording ownership and process user, default `1000:1000` |
+| `LOG_VERBOSE` | ADS-B | Debug logging, default `false` |
 
-`.env` is ignored by Git and excluded from Docker builds. Compose passes the selected values at runtime. Single-quote secrets containing `$` to prevent Compose interpolation. Exported shell variables take precedence over `.env` values. Bounding boxes remain parameters of MQTT `start` commands, and an MQTT interval overrides `INTERVAL_SECONDS` for that session.
+Put secrets containing `$` in single quotes in `.env`. The file is gitignored and excluded from service image builds. [.env.example](.env.example) documents every setting.
 
-The package can still run directly with Python 3.10+ if needed. CLI flags override environment settings; the Python process itself does not read `.env`. View available flags with `docker compose run --rm --no-deps logger adsb-logger --help`.
+For authenticated OpenSky access, create an API client in your OpenSky account and set both OAuth values. Anonymous access works with a smaller quota. The [ADS-B service guide](services/adsb-logger/README.md) covers polling, quota handling, the MQTT protocol, and output fields.
 
-## Output format
+### Network access
 
-JSON Lines stores one independent JSON object per line. Each session contains:
+The dashboard and broker bind to host loopback by default. For access to a Raspberry Pi from another machine on a trusted LAN, set `DASHBOARD_BIND_ADDRESS=0.0.0.0` and open `http://<pi-address>:3000`. The dashboard has no login and permits recording controls to anyone who can reach it. Broker host access can remain local because the dashboard uses the Docker network.
 
-1. A `start` record with session ID, bounding box, start time, and polling interval.
-2. A `snapshot` record per successful poll, including empty polls. It contains `opensky_time` (Unix seconds) and a `states` list of aircraft objects.
-3. An `error` record for failed polls, with the reason and retry delay.
-4. A `stop` record with the reason and observation counts on normal closure.
+The included broker allows anonymous clients. Configure authentication and TLS before exposing it outside the local stack. MQTT username/password settings configure clients; they do not configure the broker's access policy.
 
-Every record has `schema_version: 1`, `type`, `session_id`, and `recorded_at` (UTC ISO 8601). Records are flushed after each write, but not fsynced; abrupt termination may leave an incomplete final line and no stop record. A write failure stops the session and is reported in MQTT status and stderr.
-
-Aircraft objects use the [OpenSky field names and units](https://openskynetwork.github.io/opensky-api/rest.html#response):
-
-| Fields | Meaning / units |
-| --- | --- |
-| `icao24`, `callsign`, `origin_country` | Transponder address, trimmed callsign, country inferred from address |
-| `time_position`, `last_contact` | Last position/message timestamps, Unix seconds |
-| `longitude`, `latitude` | WGS84 decimal degrees |
-| `baro_altitude`, `geo_altitude` | Barometric/geometric altitude in meters |
-| `velocity`, `vertical_rate` | Ground speed and climb/descent rate in meters/second |
-| `true_track` | Degrees clockwise from north |
-| `on_ground`, `squawk`, `spi` | Ground flag, transponder code, special purpose indicator |
-| `sensors`, `position_source`, `category` | OpenSky receiver IDs and numeric source/category codes |
-
-Unavailable values remain JSON `null`. The API is requested with `extended=1` for aircraft categories. Unexpected additional vector fields are preserved in `extra_fields`. Snapshots are saved as received, with repeated aircraft observations across polls; there is no deduplication or interpolation. These are aircraft state summaries, not raw transponder messages or flight itineraries. The service retains all returned position sources, not just source code 0 (ADS-B).
-
-For example, read snapshots in Python without loading the entire session into memory:
-
-```python
-import json
-
-with open("data/YOUR_SESSION.jsonl") as recording:
-    for line in recording:
-        record = json.loads(line)
-        if record["type"] == "snapshot":
-            for aircraft in record["states"]:
-                print(record["opensky_time"], aircraft["icao24"], aircraft["latitude"])
-```
-
-## Polling and quotas
-
-OpenSky applies [daily credits and bounding-box-dependent costs](https://openskynetwork.github.io/opensky-api/rest.html#api-credits). At the time of implementation, anonymous access allows 400 credits/day, standard authenticated access 4,000, and a box of at most 25 square degrees costs one credit per poll. At 30 seconds, that is roughly 3 hours 20 minutes of anonymous recording, or 2,880 polls over a full day with credentials and a small box. Larger boxes cost more. The logger does not claim to enforce a daily budget.
-
-On API failures the session stays open and retries after at least 60 seconds (or the configured interval, whichever is longer). Retry headers, including `X-Rate-Limit-Retry-After-Seconds`, override the 60-second fallback when provided. Backoff persists across stop/start commands within the same service process. There is no catch-up polling: missing intervals remain gaps. Polls are scheduled one interval after each completed request. HTTP requests use 5-second connection and 20-second read timeouts; commands and shutdown wait for an in-flight poll to finish. The MQTT network loop runs separately during requests.
-
-## Development
+To use an external broker, set its reachable `MQTT_HOST`, `MQTT_PORT`, credentials, and TLS settings, then start only the applications:
 
 ```sh
-docker compose build tests
-docker compose run --rm tests
-docker compose run --rm tests ruff check .
-docker compose build dashboard-tests
+docker compose up -d --build --no-deps adsb-logger dashboard
+```
+
+Stop the bundled broker if it was already running. For a private CA, mount the certificate read-only into both applications using `compose.override.yaml` and set `MQTT_CA` to the shared container path. The dashboard uses its own generated MQTT client ID.
+
+### Recordings
+
+The existing root `./data` directory and any configured `LOG_DIR` are preserved. Custom host directories must already exist; a missing mount path fails early. Files are mounted at `/data` inside the recorder, so dashboard file paths refer to that location. Each session creates one `.jsonl` file containing start, snapshot, error, and stop records.
+
+On Linux, set `LOGGER_UID` and `LOGGER_GID` to your user's numeric IDs if different from 1000 (`id -u`, `id -g`). The recorder prepares directory ownership before dropping privileges. It does not recursively change existing files.
+
+Recordings survive rebuilds and `docker compose down`. The recorder continues through broker outages, but process restarts return it to idle. Shutdown allows two minutes for an in-flight request and final file closure.
+
+OpenSky quota exhaustion automatically closes the session, publishes `quota_exhausted` on MQTT availability, and rejects new recordings until the provider's retry time. With no retry header, the cooldown is 24 hours. A hidden `.opensky-quota.json` file in `LOG_DIR` preserves the block across restarts. Expiry allows an explicit new start; it does not poll or resume automatically. `offline` availability denotes shutdown or a broker-detected connection loss, rather than an idle recording session.
+
+## Development and checks
+
+Run checks from the stack root without installing host language runtimes:
+
+```sh
+docker compose build adsb-logger-tests dashboard-tests
+docker compose run --rm adsb-logger-tests
+docker compose run --rm adsb-logger-tests ruff check .
 docker compose run --rm dashboard-tests
 ```
 
-Tests use mocked HTTP responses and MQTT clients; they require no OpenSky account or running broker.
-
-An optional integration test uses a real local broker and an HTTP stub (no OpenSky quota):
+Test services use the `test` profile and are excluded from normal startup. For the ADS-B MQTT integration test, which uses an HTTP stub and consumes no OpenSky quota:
 
 ```sh
 docker compose up -d mqtt
-docker compose run --rm -e MQTT_TEST_PORT=1883 tests pytest -q tests/test_mqtt_integration.py
+docker compose run --rm -e MQTT_TEST_PORT=1883 adsb-logger-tests pytest -q tests/test_mqtt_integration.py
 ```
 
-The `tests` and `dashboard-tests` services use separate image stages and are excluded from normal startup. The Python integration test connects to the bundled broker by its Docker service name. Dashboard tests check command validation, MQTT acknowledgement correlation, and disconnect/error handling, followed by Nuxt type checking. Building the dashboard also verifies its production bundle.
+See each service's README for local development and standalone builds. The runtime images support AMD64 and ARM64, including 64-bit Raspberry Pi OS.
 
-For local dashboard development with Node 24:
+## Adding a service
+
+1. Create `services/<service-name>/` with its source, dependency manifest, tests, and README. Include a Dockerfile and `.dockerignore` if it needs a custom image.
+2. Add a uniquely named service to the root `compose.yaml`, with a build context scoped to that directory or an upstream image. Set health checks, required dependencies, mounts, and restart behavior there.
+3. Add deployment settings to the root `.env.example`. Reuse the shared MQTT environment anchor when appropriate; use a distinct MQTT topic namespace for the new service's commands and status.
+4. Add an optional `<service-name>-tests` service under the `test` profile, and document it in the service table above.
+
+Keep runtime data outside image build contexts. New data mounts should have an explicit location and should not move another service's existing files.
+
+## Migrating from the previous layout
+
+The former root Python package is now `services/adsb-logger/`, the Nuxt app is `services/dashboard/`, and broker configuration is `services/mqtt/mosquitto.conf`. Root-level Python packaging and image files have moved into the ADS-B service. Existing `.env`, recording files, MQTT topics, and command payloads are retained.
+
+Compose names changed from `logger` to `adsb-logger` and from `tests` to `adsb-logger-tests`. Update scripts that refer to the old service names. The project now defaults to `argus-stack` instead of the old checkout-derived name.
+
+If the old `adsb-logger` Compose project is running, finish any active recording and stop it before starting the new stack so both projects do not compete for the same ports:
 
 ```sh
-docker compose up -d mqtt logger
-cd dashboard
-npm ci
-MQTT_HOST=localhost npm run dev
+docker compose -p adsb-logger down --remove-orphans
+docker compose up -d --build
 ```
 
-If you change the broker's published port or topic prefix, pass the matching `MQTT_PORT` and `MQTT_TOPIC_PREFIX` environment variables to the development server. Production uses the shared `.env` through Compose.
+If you previously selected a different project name, use that name with `-p`. For a local editable Python install, reinstall with `pip install -e './services/adsb-logger[dev]'` from the root, or create a fresh environment in the service directory.

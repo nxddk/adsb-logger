@@ -14,7 +14,8 @@ from pathlib import Path
 import paho.mqtt.client as mqtt
 
 from .models import BoundingBox, positive_seconds
-from .opensky import OpenSkyClient, OpenSkyError
+from .opensky import OpenSkyClient, OpenSkyError, OpenSkyQuotaExhausted
+from .quota import QuotaBlockedError, QuotaGuard
 from .recording import Recording, utc_now
 
 LOG = logging.getLogger(__name__)
@@ -35,7 +36,8 @@ class RecorderService:
         self.prefix = topic_prefix
         self.default_interval = positive_seconds(interval_seconds)
         self.recording: Recording | None = None
-        self.last_error: str | None = None
+        self.quota = QuotaGuard(self.log_dir)
+        self.last_error: str | None = self.quota.reason
         self.next_poll = 0.0
         self.retry_until = 0.0
         self.stop_event = threading.Event()
@@ -88,6 +90,7 @@ class RecorderService:
 
     def status(self) -> dict:
         recording = self.recording
+        quota_exhausted = self.quota.blocked
         return {
             "state": "recording" if recording else "idle",
             "updated_at": utc_now(),
@@ -98,11 +101,63 @@ class RecorderService:
             "snapshots": recording.snapshots if recording else 0,
             "aircraft_observations": recording.aircraft_observations if recording else 0,
             "last_error": self.last_error,
-            "retry_after_seconds": max(0, self.retry_until - time.monotonic()),
+            "retry_after_seconds": (
+                max(0, self.quota.retry_at - time.time())
+                if quota_exhausted
+                else max(0, self.retry_until - time.monotonic())
+            ),
+            "quota_exhausted": quota_exhausted,
+            "quota_retry_at": self.quota.retry_at_iso,
+            "credits_remaining": self.quota.remaining
+            if quota_exhausted
+            else self._credits_remaining(),
+            "can_record": recording is None and not quota_exhausted,
         }
 
     def publish_status(self) -> None:
+        self._publish(
+            "availability", "quota_exhausted" if self.quota.blocked else "online", retain=True
+        )
         self._publish("status", self.status(), retain=True)
+
+    def _credits_remaining(self) -> int | None:
+        value = getattr(self.opensky, "credits_remaining", None)
+        return value if type(value) is int else None
+
+    def _expire_quota(self) -> bool:
+        reason = self.quota.reason
+        if not self.quota.expire():
+            return False
+        self.opensky.credits_remaining = None
+        if self.last_error == reason:
+            self.last_error = None
+        return True
+
+    def _exhaust_quota(
+        self,
+        retry_after: float,
+        remaining: int | None,
+        snapshot: dict | None = None,
+    ) -> None:
+        self.quota.block(retry_after, remaining)
+        self.last_error = self.quota.reason
+        self.retry_until = 0.0
+        LOG.warning("%s Retry permitted at %s", self.last_error, self.quota.retry_at_iso)
+        if self.recording:
+            try:
+                if snapshot is not None:
+                    self.recording.snapshot(snapshot)
+                else:
+                    self.recording.write(
+                        "error", error=self.last_error, retry_after_seconds=retry_after
+                    )
+            except (OSError, ValueError):
+                LOG.exception("Could not write the final quota record")
+            finally:
+                try:
+                    self._stop_recording("quota_exhausted")
+                except OSError:
+                    LOG.exception("Could not write the quota stop record")
 
     def _stop_recording(self, reason: str) -> None:
         if self.recording:
@@ -115,6 +170,7 @@ class RecorderService:
         raise ValueError(f"invalid JSON number: {value}")
 
     def handle_command(self, payload: bytes) -> None:
+        self._expire_quota()
         request_id = None
         command = None
         cacheable = False
@@ -128,6 +184,8 @@ class RecorderService:
             ):
                 request_id = None
                 raise ValueError("request_id must be a string of 1 to 128 characters")
+            if command.get("command") == "start" and self.quota.blocked:
+                raise QuotaBlockedError(self.quota.reason)
             if request_id in self._responses:
                 original, response = self._responses[request_id]
                 if original != command:
@@ -149,6 +207,10 @@ class RecorderService:
                     raise ValueError("already recording; stop the current session first")
                 bbox = BoundingBox.parse(command.get("bbox"))
                 interval = positive_seconds(command.get("interval_seconds", self.default_interval))
+                remaining = self._credits_remaining()
+                if remaining is not None and remaining < bbox.credit_cost:
+                    self._exhaust_quota(self.opensky.quota_retry_after, remaining)
+                    raise QuotaBlockedError(self.quota.reason)
                 self.recording = Recording(self.log_dir, bbox, interval)
                 self.last_error = None
                 self.next_poll = max(time.monotonic(), self.retry_until)
@@ -158,6 +220,15 @@ class RecorderService:
             elif action != "status":
                 raise ValueError("command must be start, stop, or status")
             response = {"ok": True, "request_id": request_id, "status": self.status()}
+        except QuotaBlockedError as exc:
+            cacheable = False
+            response = {
+                "ok": False,
+                "request_id": request_id,
+                "error": str(exc),
+                "error_code": "quota_exhausted",
+                "status": self.status(),
+            }
         except (ValueError, UnicodeError, RecursionError) as exc:
             response = {"ok": False, "request_id": request_id, "error": str(exc)}
         except OSError:
@@ -175,12 +246,27 @@ class RecorderService:
         recording = self.recording
         if recording is None:
             return
+        if self.quota.blocked:
+            self._stop_recording("quota_exhausted")
+            self.publish_status()
+            return
         try:
             data = self.opensky.fetch(recording.bbox)
-            recording.snapshot(data)
-            self.last_error = None
-            self.next_poll = time.monotonic() + recording.interval
+            remaining = self._credits_remaining()
+            if remaining is not None and remaining < recording.bbox.credit_cost:
+                self._exhaust_quota(self.opensky.quota_retry_after, remaining, snapshot=data)
+            else:
+                recording.snapshot(data)
+                self.last_error = None
+                self.next_poll = time.monotonic() + recording.interval
+        except OpenSkyQuotaExhausted as exc:
+            self._exhaust_quota(exc.retry_after, self._credits_remaining())
         except OpenSkyError as exc:
+            remaining = self._credits_remaining()
+            if remaining is not None and remaining < recording.bbox.credit_cost:
+                self._exhaust_quota(self.opensky.quota_retry_after, remaining)
+                self.publish_status()
+                return
             self.last_error = str(exc)
             self.retry_until = time.monotonic() + max(recording.interval, exc.retry_after)
             self.next_poll = self.retry_until
@@ -209,6 +295,8 @@ class RecorderService:
         LOG.info("Connecting to MQTT %s:%s; log directory %s", host, port, self.log_dir)
         try:
             while not self.stop_event.is_set():
+                if self._expire_quota():
+                    self.publish_status()
                 timeout = 0.5
                 if self.recording:
                     timeout = min(timeout, max(0, self.next_poll - time.monotonic()))
@@ -219,7 +307,6 @@ class RecorderService:
                         self.poll()
                     continue
                 if kind == "connected":
-                    self._publish("availability", "online", retain=True)
                     self.publish_status()
                 else:
                     self.handle_command(payload)
@@ -228,7 +315,7 @@ class RecorderService:
                 self._stop_recording("shutdown")
             except OSError:
                 LOG.exception("Could not write the final stop record")
-            self.publish_status()
+            self._publish("status", self.status(), retain=True)
             result = self._publish("availability", "offline", retain=True)
             if result is not None:
                 try:

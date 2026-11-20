@@ -13,6 +13,7 @@ API_URL = "https://opensky-network.org/api/states/all"
 TOKEN_URL = (
     "https://auth.opensky-network.org/auth/realms/opensky-network/protocol/openid-connect/token"
 )
+QUOTA_FALLBACK_SECONDS = 24 * 60 * 60
 
 
 class OpenSkyError(Exception):
@@ -21,7 +22,11 @@ class OpenSkyError(Exception):
         self.retry_after = retry_after
 
 
-def retry_delay(response: requests.Response) -> float:
+class OpenSkyQuotaExhausted(OpenSkyError):
+    """The states API refused another request because its credits are exhausted."""
+
+
+def retry_delay(response: requests.Response, default: float = 60) -> float:
     for header in ("X-Rate-Limit-Retry-After-Seconds", "Retry-After"):
         value = response.headers.get(header)
         if value is None:
@@ -38,7 +43,7 @@ def retry_delay(response: requests.Response) -> float:
                 continue
         if math.isfinite(seconds):
             return max(1, seconds)
-    return 60
+    return default
 
 
 class OpenSkyClient:
@@ -51,6 +56,8 @@ class OpenSkyClient:
         self.session.headers["User-Agent"] = "adsb-logger/0.1.0"
         self._token: str | None = None
         self._expires_at = 0.0
+        self.credits_remaining: int | None = None
+        self.quota_retry_after = QUOTA_FALLBACK_SECONDS
 
     def _headers(self) -> dict[str, str]:
         if not self.client_id:
@@ -77,6 +84,11 @@ class OpenSkyClient:
 
     @staticmethod
     def _check_response(response: requests.Response, operation: str) -> None:
+        if response.status_code == 429 and operation == "states request":
+            raise OpenSkyQuotaExhausted(
+                "OpenSky states quota exhausted (HTTP 429)",
+                retry_after=retry_delay(response, QUOTA_FALLBACK_SECONDS),
+            )
         if response.status_code >= 400:
             # Do not include response bodies or request objects: they may contain secrets.
             raise OpenSkyError(
@@ -93,6 +105,11 @@ class OpenSkyClient:
                     headers=self._headers(),
                     timeout=(5, 20),
                 )
+                try:
+                    self.credits_remaining = max(0, int(response.headers["X-Rate-Limit-Remaining"]))
+                except (KeyError, ValueError):
+                    self.credits_remaining = None
+                self.quota_retry_after = retry_delay(response, QUOTA_FALLBACK_SECONDS)
                 if response.status_code == 401 and self.client_id and attempt == 0:
                     self._token = None
                     continue

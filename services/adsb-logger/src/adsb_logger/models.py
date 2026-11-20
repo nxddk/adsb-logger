@@ -65,6 +65,11 @@ class BoundingBox:
     def as_dict(self) -> dict[str, float]:
         return asdict(self)
 
+    @property
+    def credit_cost(self) -> int:
+        area = (self.lamax - self.lamin) * (self.lomax - self.lomin)
+        return 1 if area <= 25 else 2 if area <= 100 else 3 if area <= 400 else 4
+
 
 def normalize_snapshot(payload: Any) -> dict[str, Any]:
     """Map positional vectors to named fields; keep future fields without data loss."""

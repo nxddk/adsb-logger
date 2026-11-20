@@ -5,7 +5,14 @@ import pytest
 import requests
 
 from adsb_logger.models import BoundingBox
-from adsb_logger.opensky import API_URL, TOKEN_URL, OpenSkyClient, OpenSkyError, retry_delay
+from adsb_logger.opensky import (
+    API_URL,
+    TOKEN_URL,
+    OpenSkyClient,
+    OpenSkyError,
+    OpenSkyQuotaExhausted,
+    retry_delay,
+)
 
 BOX = BoundingBox(43, -80.5, 44.5, -78.5)
 
@@ -77,9 +84,35 @@ def test_rate_limit_preserves_server_delay(client):
     client.session.get.return_value = response(
         429, headers={"X-Rate-Limit-Retry-After-Seconds": "7200", "Retry-After": "1"}
     )
-    with pytest.raises(OpenSkyError) as error:
+    with pytest.raises(OpenSkyQuotaExhausted) as error:
         client.fetch(BOX)
     assert error.value.retry_after == 7200
+
+
+def test_quota_without_retry_header_uses_conservative_daily_cooldown(client):
+    client.session.get.return_value = response(429)
+    with pytest.raises(OpenSkyQuotaExhausted) as error:
+        client.fetch(BOX)
+    assert error.value.retry_after == 86400
+    assert client.session.get.call_count == 1
+
+
+@pytest.mark.parametrize("header,expected", [("0", 0), ("99", 99), ("-1", 0), ("unknown", None)])
+def test_successful_response_exposes_remaining_credits_and_retry_time(client, header, expected):
+    client.session.get.return_value = response(
+        data={"time": 1, "states": []},
+        headers={"X-Rate-Limit-Remaining": header, "Retry-After": "120"},
+    )
+    assert client.fetch(BOX)["states"] == []
+    assert client.credits_remaining == expected
+    assert client.quota_retry_after == 120
+
+
+def test_missing_headers_clear_previous_balance(client):
+    client.credits_remaining = 0
+    client.session.get.return_value = response(data={"time": 1, "states": []})
+    client.fetch(BOX)
+    assert client.credits_remaining is None
 
 
 def test_retry_after_date_and_invalid_header():

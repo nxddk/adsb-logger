@@ -4,7 +4,7 @@ from unittest.mock import Mock, patch
 import paho.mqtt.client as mqtt
 import pytest
 
-from adsb_logger.opensky import OpenSkyClient, OpenSkyError
+from adsb_logger.opensky import OpenSkyClient, OpenSkyError, OpenSkyQuotaExhausted
 from adsb_logger.service import RecorderService
 
 BOX = {"lamin": 43, "lomin": -80.5, "lamax": 44.5, "lomax": -78.5}
@@ -16,6 +16,8 @@ def service(tmp_path):
     client.is_connected.return_value = True
     client.publish.return_value.rc = mqtt.MQTT_ERR_SUCCESS
     opensky = Mock(spec=OpenSkyClient)
+    opensky.credits_remaining = None
+    opensky.quota_retry_after = 86400
     opensky.fetch.return_value = {"opensky_time": 1, "states": [{"icao24": "c01234"}]}
     recorder = RecorderService(client, opensky, tmp_path / "recordings")
     yield recorder
@@ -144,3 +146,101 @@ def test_disconnected_service_keeps_recording_and_republishes_on_request(service
     service.client.is_connected.return_value = True
     service.publish_status()
     assert json.loads(service.client.publish.call_args.args[1])["snapshots"] == 1
+
+
+def test_429_closes_session_blocks_new_and_replayed_starts_and_publishes_quota(service):
+    command(service, "start", bbox=BOX, request_id="first-start")
+    recording = service.recording
+    service.opensky.fetch.side_effect = OpenSkyQuotaExhausted("quota exhausted", 7200)
+    service.poll()
+    assert service.recording is None
+    assert recording._file.closed
+    assert service.status()["quota_exhausted"]
+    assert not service.status()["can_record"]
+    assert service.status()["quota_retry_at"]
+    assert service.status()["retry_after_seconds"] > 7190
+    records = [json.loads(line) for line in recording.path.read_text().splitlines()]
+    assert [r["type"] for r in records] == ["start", "error", "stop"]
+    assert records[-1]["reason"] == "quota_exhausted"
+    for request_id in ("next-start", "first-start", None):
+        result = command(service, "start", bbox=BOX, request_id=request_id)
+        assert not result["ok"]
+        assert result["error_code"] == "quota_exhausted"
+        assert result["status"]["quota_exhausted"]
+        service.poll()
+    service.opensky.fetch.assert_called_once()
+    assert len(list(service.log_dir.glob("*.jsonl"))) == 1
+    assert command(service, "status")["ok"]
+    assert command(service, "stop")["ok"]
+    availability = [
+        c for c in service.client.publish.call_args_list if c.args[0].endswith("/availability")
+    ]
+    assert availability[-1].args[1] == "quota_exhausted"
+    assert availability[-1].kwargs["retain"]
+
+
+@pytest.mark.parametrize(
+    "box,remaining", [(BOX, 0), ({"lamin": 0, "lomin": 0, "lamax": 20, "lomax": 30}, 3)]
+)
+def test_last_successful_snapshot_is_saved_before_quota_stop(service, box, remaining):
+    command(service, "start", bbox=box)
+    recording = service.recording
+    service.opensky.credits_remaining = remaining
+    service.opensky.quota_retry_after = 3600
+    service.poll()
+    assert service.recording is None
+    assert service.status()["credits_remaining"] == remaining
+    records = [json.loads(line) for line in recording.path.read_text().splitlines()]
+    assert [r["type"] for r in records] == ["start", "snapshot", "stop"]
+    assert records[-1]["reason"] == "quota_exhausted"
+    assert records[-1]["snapshots"] == 1
+
+
+def test_known_insufficient_balance_rejects_start_without_a_file_or_request(service):
+    service.opensky.credits_remaining = 1
+    large_box = {"lamin": 0, "lomin": 0, "lamax": 20, "lomax": 30}
+    result = command(service, "start", bbox=large_box)
+    assert result["error_code"] == "quota_exhausted"
+    assert not list(service.log_dir.glob("*.jsonl"))
+    service.opensky.fetch.assert_not_called()
+
+
+def test_quota_lock_survives_service_restart_and_expires_without_auto_polling(service):
+    with patch("adsb_logger.quota.time.time", return_value=1700000000):
+        command(service, "start", bbox=BOX)
+        service.opensky.fetch.side_effect = OpenSkyQuotaExhausted("quota exhausted", 120)
+        service.poll()
+        restarted_api = Mock(spec=OpenSkyClient)
+        restarted = RecorderService(service.client, restarted_api, service.log_dir)
+        assert restarted.status()["quota_exhausted"]
+        assert not command(restarted, "start", bbox=BOX)["ok"]
+        restarted_api.fetch.assert_not_called()
+    with patch("adsb_logger.quota.time.time", return_value=1700000121):
+        assert restarted._expire_quota()
+        restarted.publish_status()
+        assert not restarted.status()["quota_exhausted"]
+        assert restarted.status()["can_record"]
+        assert restarted.status()["quota_retry_at"] is None
+        assert restarted.last_error is None
+        assert restarted.recording is None
+        restarted_api.fetch.assert_not_called()
+        assert not restarted.quota.path.exists()
+        assert command(restarted, "start", bbox=BOX)["ok"]
+        restarted._stop_recording("test_cleanup")
+
+
+def test_quota_lock_applies_even_if_the_final_snapshot_write_fails(service):
+    command(service, "start", bbox=BOX)
+    recording = service.recording
+    service.opensky.credits_remaining = 0
+    with patch.object(recording, "snapshot", side_effect=OSError("disk full")):
+        service.poll()
+    assert service.status()["quota_exhausted"]
+    assert service.recording is None
+    assert recording._file.closed
+
+
+def test_service_uses_offline_last_will(service):
+    service.client.will_set.assert_called_once_with(
+        "adsb-logger/availability", "offline", qos=1, retain=True
+    )

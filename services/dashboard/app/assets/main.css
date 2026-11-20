@@ -194,6 +194,10 @@ h1 {
   background: #619c76;
   box-shadow: 0 0 0 6px #619c7617;
 }
+.status-dot.exhausted {
+  background: #b48736;
+  box-shadow: 0 0 0 6px #b4873617;
+}
 .status-dot.active {
   background: #399267;
   box-shadow: 0 0 0 6px #39926721;
@@ -267,10 +271,33 @@ fieldset {
 fieldset:disabled {
   opacity: 0.62;
 }
-.coordinate-grid {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 20px 18px;
+.bbox-format {
+  margin: 8px 0;
+  color: var(--muted);
+  font:
+    11px ui-monospace,
+    SFMono-Regular,
+    monospace;
+}
+.bbox-input {
+  display: block;
+  width: 100%;
+  min-height: 78px;
+  resize: vertical;
+  border: 1px solid #dce2d9;
+  border-radius: 5px;
+  background: #fafbf8;
+  color: #2d443d;
+  padding: 12px;
+  font:
+    13px/1.65 ui-monospace,
+    SFMono-Regular,
+    monospace;
+}
+.bbox-input:focus {
+  outline: none;
+  border-color: #548f79;
+  box-shadow: 0 0 0 3px #548f7919;
 }
 label {
   display: block;
@@ -672,9 +699,6 @@ footer {
   }
   .panel {
     padding: 23px 20px;
-  }
-  .coordinate-grid {
-    gap: 19px 14px;
   }
   label > span {
     margin: 5px 0 0;

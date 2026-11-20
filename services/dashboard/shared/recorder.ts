@@ -16,11 +16,15 @@ export interface RecorderStatus {
   aircraft_observations: number
   last_error: string | null
   retry_after_seconds: number
+  quota_exhausted: boolean
+  quota_retry_at: string | null
+  credits_remaining: number | null
+  can_record: boolean
 }
 
 export interface DashboardState {
   brokerConnected: boolean
-  availability: 'online' | 'offline' | 'unknown'
+  availability: 'online' | 'offline' | 'quota_exhausted' | 'unknown'
   status: RecorderStatus | null
   defaultInterval: number
 }
@@ -34,6 +38,28 @@ export interface CommandResponse {
   request_id: string
   status?: RecorderStatus
   error?: string
+  error_code?: string
+}
+
+export function formatBoundingBox(bbox: BoundingBox): string {
+  return [bbox.lomin, bbox.lamin, bbox.lomax, bbox.lamax].join(',')
+}
+
+export function parseBoundingBox(input: string): BoundingBox {
+  const parts = input.split(',').map((part) => part.trim())
+  if (parts.length !== 4 || parts.some((part) => part === '')) {
+    throw new Error(
+      'Enter four comma-separated coordinates: west,south,east,north.',
+    )
+  }
+  const bbox = {
+    lomin: Number(parts[0]),
+    lamin: Number(parts[1]),
+    lomax: Number(parts[2]),
+    lamax: Number(parts[3]),
+  }
+  validateCommand({ command: 'start', bbox })
+  return bbox
 }
 
 function isObject(value: unknown): value is Record<string, unknown> {

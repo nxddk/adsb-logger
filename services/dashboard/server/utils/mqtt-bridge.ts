@@ -61,7 +61,13 @@ export class MqttBridge {
     client.on('message', (topic, payload) => {
       if (topic === `${prefix}/availability`) {
         const value = payload.toString()
-        if (value === 'online' || value === 'offline') this.availability = value
+        if (
+          value === 'online' ||
+          value === 'offline' ||
+          value === 'quota_exhausted'
+        ) {
+          this.availability = value
+        }
         return
       }
       try {
@@ -114,10 +120,24 @@ export class MqttBridge {
         new BridgeError('The dashboard is not connected to the MQTT broker.'),
       )
     }
-    if (this.availability !== 'online') {
+    if (
+      this.availability !== 'online' &&
+      this.availability !== 'quota_exhausted'
+    ) {
       return Promise.reject(
         new BridgeError(
           'The recording service is offline or has not reported availability.',
+        ),
+      )
+    }
+    if (
+      command.command === 'start' &&
+      this.availability === 'quota_exhausted'
+    ) {
+      return Promise.reject(
+        new BridgeError(
+          'OpenSky quota exhausted. New recordings are blocked until the retry time.',
+          409,
         ),
       )
     }

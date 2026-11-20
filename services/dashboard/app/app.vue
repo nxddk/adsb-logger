@@ -1,6 +1,10 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
-import { validateCommand } from '#shared/recorder'
+import {
+  formatBoundingBox,
+  parseBoundingBox,
+  validateCommand,
+} from '#shared/recorder'
 import type {
   CommandResponse,
   DashboardState,
@@ -12,11 +16,9 @@ const {
   error: connectionError,
   refresh,
 } = await useFetch<DashboardState>('/api/status')
+const exampleBBox = '-73.617067,45.471297,-73.576427,45.489201'
 const form = reactive({
-  lamin: 43,
-  lamax: 44.5,
-  lomin: -80.5,
-  lomax: -78.5,
+  bbox: exampleBBox,
   interval: 30,
 })
 const pending = ref<string | null>(null)
@@ -30,7 +32,12 @@ const online = computed(
   () =>
     !connectionError.value &&
     data.value?.brokerConnected &&
-    data.value?.availability === 'online',
+    ['online', 'quota_exhausted'].includes(data.value?.availability || ''),
+)
+const quotaExhausted = computed(
+  () =>
+    data.value?.availability === 'quota_exhausted' ||
+    !!status.value?.quota_exhausted,
 )
 const recording = computed(() => status.value?.state === 'recording')
 const stateLabel = computed(() => {
@@ -38,6 +45,7 @@ const stateLabel = computed(() => {
   if (!data.value?.brokerConnected) return 'Broker disconnected'
   if (data.value.availability === 'offline') return 'Logger offline'
   if (!online.value || !status.value) return 'Waiting for logger'
+  if (quotaExhausted.value) return 'Quota exhausted'
   return recording.value ? 'Recording' : 'Ready to record'
 })
 const retrySeconds = computed(() =>
@@ -56,7 +64,8 @@ watch(
   () => status.value?.session_id,
   (sessionId) => {
     if (sessionId && status.value?.bbox) {
-      Object.assign(form, status.value.bbox, {
+      Object.assign(form, {
+        bbox: formatBoundingBox(status.value.bbox),
         interval: status.value.interval_seconds,
       })
     }
@@ -116,20 +125,20 @@ async function send(command: RecorderCommand) {
 }
 
 function start() {
-  return send({
-    command: 'start',
-    bbox: {
-      lamin: form.lamin,
-      lomin: form.lomin,
-      lamax: form.lamax,
-      lomax: form.lomax,
-    },
-    interval_seconds: form.interval,
-  })
+  try {
+    return send({
+      command: 'start',
+      bbox: parseBoundingBox(form.bbox),
+      interval_seconds: form.interval,
+    })
+  } catch (error) {
+    message.value = ''
+    failure.value = (error as Error).message
+  }
 }
 
-function useToronto() {
-  Object.assign(form, { lamin: 43, lamax: 44.5, lomin: -80.5, lomax: -78.5 })
+function useExample() {
+  form.bbox = exampleBBox
 }
 </script>
 
@@ -175,7 +184,8 @@ function useToronto() {
             class="status-dot"
             :class="{
               active: online && recording,
-              ready: online && !recording,
+              ready: online && !recording && !quotaExhausted,
+              exhausted: online && quotaExhausted,
             }"
           />
           <div>
@@ -211,6 +221,21 @@ function useToronto() {
         >
       </div>
 
+      <div v-else-if="quotaExhausted" class="notice" role="status">
+        <strong>OpenSky quota exhausted. Recording has stopped.</strong>
+        <span
+          >New recordings are blocked until
+          <ClientOnly
+            >{{
+              status?.quota_retry_at
+                ? new Date(status.quota_retry_at).toLocaleString()
+                : 'the retry time'
+            }}<template #fallback>the retry time</template></ClientOnly
+          >. Start a new recording after that time; capture will not resume
+          automatically.
+        </span>
+      </div>
+
       <div class="content-grid">
         <section class="panel control-panel">
           <div class="panel-heading">
@@ -221,74 +246,29 @@ function useToronto() {
             <span class="coordinate-tag">WGS84</span>
           </div>
           <p class="section-description">
-            Define a rectangular area using latitude and longitude in decimal
-            degrees.
+            Paste the bounding box as longitude, latitude, longitude, latitude
+            in decimal degrees.
           </p>
           <form @submit.prevent="start">
             <fieldset :disabled="!!pending || recording">
               <legend class="sr-only">Recording configuration</legend>
-              <div class="coordinate-grid">
-                <label for="north"
-                  >North latitude<span>Maximum</span>
-                  <div class="input-wrap">
-                    <input
-                      id="north"
-                      v-model.number="form.lamax"
-                      type="number"
-                      min="-90"
-                      max="90"
-                      step="any"
-                      required
-                    /><span>°</span>
-                  </div></label
-                >
-                <label for="south"
-                  >South latitude<span>Minimum</span>
-                  <div class="input-wrap">
-                    <input
-                      id="south"
-                      v-model.number="form.lamin"
-                      type="number"
-                      min="-90"
-                      max="90"
-                      step="any"
-                      required
-                    /><span>°</span>
-                  </div></label
-                >
-                <label for="west"
-                  >West longitude<span>Minimum</span>
-                  <div class="input-wrap">
-                    <input
-                      id="west"
-                      v-model.number="form.lomin"
-                      type="number"
-                      min="-180"
-                      max="180"
-                      step="any"
-                      required
-                    /><span>°</span>
-                  </div></label
-                >
-                <label for="east"
-                  >East longitude<span>Maximum</span>
-                  <div class="input-wrap">
-                    <input
-                      id="east"
-                      v-model.number="form.lomax"
-                      type="number"
-                      min="-180"
-                      max="180"
-                      step="any"
-                      required
-                    /><span>°</span>
-                  </div></label
-                >
-              </div>
+              <label for="bbox">Bounding box</label>
+              <p id="bbox-format" class="bbox-format">west,south,east,north</p>
+              <textarea
+                id="bbox"
+                v-model="form.bbox"
+                class="bbox-input"
+                :placeholder="exampleBBox"
+                rows="2"
+                spellcheck="false"
+                autocomplete="off"
+                aria-describedby="bbox-format"
+                required
+              />
               <div class="area-hint">
                 <span>Set your area before starting.</span
-                ><button type="button" class="text-button" @click="useToronto">
-                  Use Toronto example ↗
+                ><button type="button" class="text-button" @click="useExample">
+                  Use example ↗
                 </button>
               </div>
               <div class="interval-row">
@@ -316,7 +296,9 @@ function useToronto() {
               <button
                 class="button primary"
                 type="submit"
-                :disabled="!!pending || !online || !status || recording"
+                :disabled="
+                  !!pending || !online || !status || recording || quotaExhausted
+                "
               >
                 <span aria-hidden="true">●</span
                 >{{ pending === 'start' ? 'Starting…' : 'Start recording' }}
@@ -365,22 +347,30 @@ function useToronto() {
             }}</span>
             <h3>
               {{
-                recording
-                  ? online
-                    ? 'Capture in progress'
-                    : 'Last seen recording'
-                  : 'Standing by'
+                quotaExhausted && online
+                  ? 'Quota exhausted'
+                  : recording
+                    ? online
+                      ? 'Capture in progress'
+                      : 'Last seen recording'
+                    : 'Standing by'
               }}
             </h3>
             <p>
               {{
-                recording
-                  ? 'Each poll is appended to your session file.'
-                  : 'Start a recording to begin collecting aircraft snapshots.'
+                quotaExhausted && online
+                  ? 'Your recording was closed. Start a new session after the quota cooldown.'
+                  : recording
+                    ? 'Each poll is appended to your session file.'
+                    : 'Start a recording to begin collecting aircraft snapshots.'
               }}
             </p>
           </div>
           <dl class="session-details">
+            <div>
+              <dt>OpenSky credits remaining</dt>
+              <dd>{{ status?.credits_remaining ?? 'Not reported yet' }}</dd>
+            </div>
             <div>
               <dt>Session ID</dt>
               <dd class="mono">{{ status?.session_id || '—' }}</dd>
