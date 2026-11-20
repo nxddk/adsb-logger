@@ -1,4 +1,30 @@
 services:
+  dashboard:
+    build:
+      context: ./dashboard
+      target: runtime
+    environment:
+      MQTT_HOST: ${MQTT_HOST:-mqtt}
+      MQTT_PORT: ${MQTT_PORT:-1883}
+      MQTT_TOPIC_PREFIX: ${MQTT_TOPIC_PREFIX:-adsb-logger}
+      MQTT_USERNAME: ${MQTT_USERNAME:-}
+      MQTT_PASSWORD: ${MQTT_PASSWORD:-}
+      MQTT_TLS: ${MQTT_TLS:-false}
+      MQTT_CA: ${MQTT_CA:-}
+      INTERVAL_SECONDS: ${INTERVAL_SECONDS:-30}
+    ports:
+      - "${DASHBOARD_BIND_ADDRESS:-127.0.0.1}:${DASHBOARD_PORT:-3000}:3000"
+    depends_on:
+      mqtt:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/api/status').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
   logger:
     build:
       context: .
@@ -52,3 +78,9 @@ services:
       target: test
     environment:
       MQTT_TEST_HOST: mqtt
+
+  dashboard-tests:
+    profiles: ["test"]
+    build:
+      context: ./dashboard
+      target: test

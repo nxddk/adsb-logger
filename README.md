@@ -1,10 +1,10 @@
 # ADS-B logger
 
-A small Python service that records live [OpenSky aircraft state snapshots](https://openskynetwork.github.io/opensky-api/rest.html), controlled over MQTT. Docker Compose runs both the logger and its Mosquitto MQTT broker. It starts **idle**, supports one recording at a time, and polls every 30 seconds by default.
+A small Python service that records live [OpenSky aircraft state snapshots](https://openskynetwork.github.io/opensky-api/rest.html), controlled over MQTT or a Nuxt web dashboard. Docker Compose runs the logger, its Mosquitto MQTT broker, and the dashboard. It starts **idle**, supports one recording at a time, and polls every 30 seconds by default.
 
 ## Install and run
 
-Requires Docker Engine and Docker Compose. No host Python installation is needed. From this repository:
+Requires Docker Engine and Docker Compose. No host Python or Node installation is needed. From this repository:
 
 ```sh
 cp .env.example .env
@@ -13,7 +13,13 @@ docker compose up -d --build
 docker compose logs -f logger
 ```
 
-Compose reads `.env` automatically and supplies configuration to the logger. It waits for the broker health check before starting the logger, and both services restart with Docker unless explicitly stopped. After editing `.env`, run `docker compose up -d` again to apply changes; `docker compose restart` alone does not reload environment variables. Rebuild with `--build` after changing Python source.
+Open **http://localhost:3000** for the dashboard. Set the capture area's south/north latitude, west/east longitude, and polling interval, then choose **Start recording**. **Stop** closes the session file. The dashboard shows live service availability, snapshot and aircraft-observation counts, active area, output path, and API errors. **Refresh status** requests a fresh update from the logger.
+
+The dashboard connects to MQTT on the server; broker credentials are never sent to the browser. Its automatic two-second status refresh reads the server's MQTT cache and does not make extra OpenSky requests. Commands wait for a matching acknowledgement from the logger, which can be delayed by an in-flight API request. Offline controls are disabled, and retained status is shown as the last reported state while disconnected.
+
+`DASHBOARD_PORT` changes the dashboard's host port. By default it binds to `127.0.0.1`. To reach a Raspberry Pi from another machine on a trusted LAN, set `DASHBOARD_BIND_ADDRESS=0.0.0.0` in `.env` and open `http://<pi-address>:3000`. The dashboard has no login and grants recording controls to anyone who can reach it. Broker access can remain bound to loopback because the dashboard talks to it over the Docker network.
+
+Compose reads `.env` automatically and supplies configuration to the services. It waits for the broker health check before starting the logger and dashboard, and all three services restart with Docker unless explicitly stopped. After editing `.env`, run `docker compose up -d` again to apply changes; `docker compose restart` alone does not reload environment variables. Rebuild with `--build` after changing source files.
 
 Recordings go to `LOG_DIR` on the **host**, defaulting to this repo's `./data` folder (included as an empty directory; recordings are gitignored). Set `LOG_DIR=/path/to/recordings` in `.env` to choose another location, and create that host directory before starting Compose. The mount requires an existing directory so a missing or mistyped path fails instead of silently putting recordings elsewhere. Inside the logger container this folder is always `/data`, so MQTT status reports paths such as `/data/SESSION.jsonl`. Every session gets a unique file; recordings survive container restarts, rebuilds, and `docker compose down`.
 
@@ -102,14 +108,15 @@ MQTT_TLS=true
 MQTT_TOPIC_PREFIX=aircraft/logger
 ```
 
-Then run `docker compose up -d --build --no-deps logger` to start only the logger. If you previously ran the bundled broker, stop it with `docker compose stop mqtt`. Setting MQTT credentials configures the logger's connection; it does not configure authentication on the bundled broker.
+Then run `docker compose up -d --build --no-deps logger dashboard` to start the logger and dashboard without the bundled broker. If you previously ran the bundled broker, stop it with `docker compose stop mqtt`. Setting MQTT credentials configures client connections; it does not configure authentication on the bundled broker. The dashboard uses its own generated MQTT client ID to avoid disconnecting the logger.
 
-`MQTT_TLS=true` uses verified TLS with system CA certificates. For a private CA, set `MQTT_CA=/certs/ca.pem` and add a read-only certificate bind mount to `logger` in a `compose.override.yaml` file. The port remains 1883 unless explicitly changed. Use a separate topic prefix for each logger instance.
+`MQTT_TLS=true` uses verified TLS with system CA certificates. For a private CA, set `MQTT_CA=/certs/ca.pem` and add a read-only certificate bind mount to **both** `logger` and `dashboard` in a `compose.override.yaml` file. The port remains 1883 unless explicitly changed. Use a separate topic prefix for each logger instance.
 
 | `.env` setting | Meaning | Default |
 | --- | --- | --- |
 | `LOG_DIR` | Host directory mounted at `/data` | `./data` |
 | `INTERVAL_SECONDS` | Default polling interval, >= 10 seconds | `30` |
+| `DASHBOARD_BIND_ADDRESS`, `DASHBOARD_PORT` | Host interface and port for the web dashboard | `127.0.0.1`, `3000` |
 | `LOGGER_UID`, `LOGGER_GID` | Numeric user/group for Python and recording ownership | `1000` |
 | `MQTT_HOST`, `MQTT_PORT` | Broker address from inside the logger container | `mqtt`, `1883` |
 | `MQTT_TOPIC_PREFIX` | Topic prefix for commands and status | `adsb-logger` |
@@ -176,6 +183,8 @@ On API failures the session stays open and retries after at least 60 seconds (or
 docker compose build tests
 docker compose run --rm tests
 docker compose run --rm tests ruff check .
+docker compose build dashboard-tests
+docker compose run --rm dashboard-tests
 ```
 
 Tests use mocked HTTP responses and MQTT clients; they require no OpenSky account or running broker.
@@ -187,4 +196,15 @@ docker compose up -d mqtt
 docker compose run --rm -e MQTT_TEST_PORT=1883 tests pytest -q tests/test_mqtt_integration.py
 ```
 
-The `tests` service uses a separate image stage and is excluded from normal startup. It connects to the bundled broker by its Docker service name.
+The `tests` and `dashboard-tests` services use separate image stages and are excluded from normal startup. The Python integration test connects to the bundled broker by its Docker service name. Dashboard tests check command validation, MQTT acknowledgement correlation, and disconnect/error handling, followed by Nuxt type checking. Building the dashboard also verifies its production bundle.
+
+For local dashboard development with Node 24:
+
+```sh
+docker compose up -d mqtt logger
+cd dashboard
+npm ci
+MQTT_HOST=localhost npm run dev
+```
+
+If you change the broker's published port or topic prefix, pass the matching `MQTT_PORT` and `MQTT_TOPIC_PREFIX` environment variables to the development server. Production uses the shared `.env` through Compose.
