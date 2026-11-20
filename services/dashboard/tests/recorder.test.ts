@@ -4,12 +4,39 @@ import { test } from 'node:test'
 import type { MqttClient } from 'mqtt'
 import {
   formatBoundingBox,
+  estimateBboxCredits,
   parseBoundingBox,
   validateCommand,
 } from '../shared/recorder.ts'
 import { MqttBridge } from '../server/utils/mqtt-bridge.ts'
 
 const bbox = { lamin: 43, lomin: -80.5, lamax: 44.5, lomax: -78.5 }
+
+test('BBOX credit estimate follows inclusive OpenSky tier boundaries', () => {
+  for (const [latitude, longitude, expected] of [
+    [5, 5, 1],
+    [5, 5.001, 2],
+    [10, 10, 2],
+    [10, 10.001, 3],
+    [20, 20, 3],
+    [20, 20.001, 4],
+  ]) {
+    const estimate = estimateBboxCredits({
+      lamin: 0,
+      lomin: 0,
+      lamax: latitude!,
+      lomax: longitude!,
+    })
+    assert.equal(estimate.credits, expected)
+    assert.equal(estimate.area, latitude! * longitude!)
+  }
+  assert.equal(
+    estimateBboxCredits(
+      parseBoundingBox('-73.617067,45.471297,-73.576427,45.489201'),
+    ).credits,
+    1,
+  )
+})
 
 test('comma-separated boxes use west,south,east,north and retain decimal precision', () => {
   const input = '-73.617067,45.471297,-73.576427,45.489201'

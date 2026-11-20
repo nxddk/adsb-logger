@@ -367,6 +367,40 @@ label > span {
   align-items: center;
   gap: 18px;
 }
+.credit-estimate {
+  margin-bottom: 22px;
+  padding: 14px;
+  background: #f0f5ec;
+  border: 1px solid #dce6d6;
+  border-radius: 6px;
+}
+.estimate-heading {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+.estimate-heading strong {
+  font-size: 13px;
+  font-weight: 600;
+}
+.estimate-heading span {
+  font:
+    11px ui-monospace,
+    monospace;
+  color: var(--muted);
+}
+.credit-estimate p,
+.estimate-placeholder {
+  font-size: 10px;
+  line-height: 1.65;
+  color: var(--muted);
+  margin: 8px 0 0;
+}
+.estimate-placeholder {
+  margin-bottom: 22px;
+}
 .interval-row label > span {
   display: block;
   margin: 7px 0 0;

@@ -1,6 +1,6 @@
 # Dashboard
 
-The Argus Stack web dashboard is a Nuxt application with a server-side MQTT bridge. It currently provides ADS-B start/stop controls, bounding-box and polling-interval inputs, live status, recording counts, and file/error details. The Python recorder owns recording state and files; the dashboard waits for MQTT acknowledgements before reporting command success.
+The Argus Stack web dashboard is a Nuxt application with a server-side MQTT bridge. It currently provides ADS-B start/stop controls, bounding-box and polling-interval inputs, live status, recording counts, and database/error details. The Python recorder owns recording state and the SQLite database; the dashboard waits for MQTT acknowledgements before reporting command success.
 
 ## Run
 
@@ -19,6 +19,10 @@ Paste the bounding box into the single field as `west,south,east,north` (longitu
 ```
 
 Whitespace around commas is accepted. The dashboard validates bounds and converts this input into the recorder's named-coordinate MQTT payload.
+
+A live calculator below the BBOX shows its area in square degrees and credits per query: ≤25 °² costs 1, >25–100 costs 2, >100–400 costs 3, and >400 costs 4. It also estimates hourly/daily use at the entered polling interval. These are local calculations and make no OpenSky requests. Totals assume continuous successful polling; request duration and retries affect actual usage. Invalid bounds suppress the estimate until corrected.
+
+The session monitor shows the SQLite database path and session ID. All snapshots live in the recorder's shared database; the dashboard does not need a database container or filesystem mount.
 
 The server uses the same `MQTT_*` settings as the ADS-B service, with its own generated MQTT client ID. Broker credentials stay on the server and are never sent to the browser. `INTERVAL_SECONDS` sets the form's default polling interval. For a private broker CA, mount the certificate read-only into both the dashboard and recorder and set `MQTT_CA` to its container path.
 

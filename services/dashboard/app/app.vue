@@ -2,6 +2,7 @@
 import { computed, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
 import {
   formatBoundingBox,
+  estimateBboxCredits,
   parseBoundingBox,
   validateCommand,
 } from '#shared/recorder'
@@ -59,6 +60,25 @@ const retrySeconds = computed(() =>
   ),
 )
 const count = (value?: number) => (value || 0).toLocaleString('en-US')
+const creditEstimate = computed(() => {
+  try {
+    return estimateBboxCredits(parseBoundingBox(form.bbox))
+  } catch {
+    return null
+  }
+})
+const creditRate = computed(() => {
+  if (
+    !creditEstimate.value ||
+    !Number.isFinite(form.interval) ||
+    form.interval < 10
+  )
+    return null
+  const perHour = (creditEstimate.value.credits * 3600) / form.interval
+  return { perHour, perDay: perHour * 24 }
+})
+const estimateNumber = (value: number) =>
+  value.toLocaleString('en-US', { maximumFractionDigits: 1 })
 
 watch(
   () => status.value?.session_id,
@@ -107,7 +127,7 @@ async function send(command: RecorderCommand) {
       command.command === 'start'
         ? 'Recording started.'
         : command.command === 'stop'
-          ? 'Recording stopped. Your file has been closed.'
+          ? 'Recording stopped. Your session has been saved.'
           : 'Status refreshed.'
     await refresh()
   } catch (error) {
@@ -171,7 +191,7 @@ function useExample() {
             Choose an area. Record the aircraft passing through it.
           </p>
         </div>
-        <span class="format-tag">JSON LINES</span>
+        <span class="format-tag">SQLITE</span>
       </div>
 
       <section
@@ -271,6 +291,40 @@ function useExample() {
                   Use example ↗
                 </button>
               </div>
+              <div
+                v-if="creditEstimate"
+                class="credit-estimate"
+                aria-live="polite"
+              >
+                <div class="estimate-heading">
+                  <strong
+                    >{{ creditEstimate.credits }}
+                    {{ creditEstimate.credits === 1 ? 'credit' : 'credits' }} /
+                    query</strong
+                  >
+                  <span
+                    >{{
+                      creditEstimate.area.toLocaleString('en-US', {
+                        maximumSignificantDigits: 4,
+                      })
+                    }}
+                    °²</span
+                  >
+                </div>
+                <p v-if="creditRate">
+                  Approximately
+                  {{ estimateNumber(creditRate.perHour) }} credits/hour ·
+                  {{ estimateNumber(creditRate.perDay) }} credits/day at
+                  {{ form.interval }} sec.
+                </p>
+                <p>
+                  Based on BBOX area, not aircraft count. Estimates assume
+                  continuous successful polling.
+                </p>
+              </div>
+              <p v-else class="estimate-placeholder" aria-live="polite">
+                Enter a valid BBOX to estimate credit use.
+              </p>
               <div class="interval-row">
                 <label for="interval"
                   >Polling interval<span
@@ -289,7 +343,7 @@ function useExample() {
                 </div>
               </div>
               <p class="quota-hint">
-                Smaller areas and longer intervals use fewer API credits.
+                ≤25 °²: 1 credit · ≤100: 2 · ≤400: 3 · larger: 4 per query.
               </p>
             </fieldset>
             <div class="control-actions">
@@ -321,7 +375,8 @@ function useExample() {
             </p>
             <p v-else-if="message" class="success">{{ message }}</p>
             <p v-else>
-              One recording session at a time. Files are saved automatically.
+              One recording session at a time. Snapshots are saved
+              automatically.
             </p>
           </div>
         </section>
@@ -361,7 +416,7 @@ function useExample() {
                 quotaExhausted && online
                   ? 'Your recording was closed. Start a new session after the quota cooldown.'
                   : recording
-                    ? 'Each poll is appended to your session file.'
+                    ? 'Each poll is saved to the recording database.'
                     : 'Start a recording to begin collecting aircraft snapshots.'
               }}
             </p>
@@ -376,9 +431,13 @@ function useExample() {
               <dd class="mono">{{ status?.session_id || '—' }}</dd>
             </div>
             <div>
-              <dt>Output file</dt>
+              <dt>SQLite database</dt>
               <dd class="mono">
-                {{ status?.file || 'Created when recording starts' }}
+                {{
+                  status?.database ||
+                  status?.file ||
+                  'Created when recording starts'
+                }}
               </dd>
             </div>
             <div>

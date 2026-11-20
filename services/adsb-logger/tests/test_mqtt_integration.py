@@ -28,7 +28,7 @@ def wait_for(predicate, timeout=10):
     raise AssertionError("timed out waiting for MQTT integration event")
 
 
-def test_real_mqtt_and_http_recording(tmp_path, monkeypatch):
+def test_real_mqtt_and_http_recording(tmp_path, monkeypatch, read_records):
     requests_received = []
 
     class Handler(BaseHTTPRequestHandler):
@@ -87,7 +87,7 @@ def test_real_mqtt_and_http_recording(tmp_path, monkeypatch):
         send(start, retain=True)
         worker.start()
         wait_for(lambda: has_status(state="idle"))
-        assert not list(tmp_path.glob("*.jsonl"))
+        assert not (tmp_path / "adsb.sqlite3").exists()
         send({**start, "request_id": "start-1"})
         wait_for(lambda: has_status(state="recording", snapshots=1))
         assert requests_received == [
@@ -106,9 +106,7 @@ def test_real_mqtt_and_http_recording(tmp_path, monkeypatch):
                 for topic, body in list(messages)
             )
         )
-        files = list(tmp_path.glob("*.jsonl"))
-        assert len(files) == 1
-        records = [json.loads(line) for line in files[0].read_text().splitlines()]
+        records = read_records(tmp_path / "adsb.sqlite3")
         assert [record["type"] for record in records] == ["start", "snapshot", "stop"]
         service.stop_event.set()
         worker.join(timeout=5)
@@ -131,6 +129,7 @@ def test_quota_stops_requests_and_broadcasts_until_cooldown_expires(
     tmp_path,
     monkeypatch,
     http_status,
+    read_records,
 ):
     requests_received = []
 
@@ -192,9 +191,7 @@ def test_quota_stops_requests_and_broadcasts_until_cooldown_expires(
             )
         )
         assert service.recording is None
-        records = [
-            json.loads(line) for line in next(tmp_path.glob("*.jsonl")).read_text().splitlines()
-        ]
+        records = read_records(tmp_path / "adsb.sqlite3")
         assert records[-1]["reason"] == "quota_exhausted"
         wait_for(lambda: (f"{prefix}/availability", "online") in messages[quota_index + 1 :])
         assert len(requests_received) == 1

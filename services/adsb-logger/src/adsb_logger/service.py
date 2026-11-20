@@ -17,6 +17,7 @@ from .models import BoundingBox, positive_seconds
 from .opensky import OpenSkyClient, OpenSkyError, OpenSkyQuotaExhausted
 from .quota import QuotaBlockedError, QuotaGuard
 from .recording import Recording, utc_now
+from .storage import DATABASE_FILENAME
 
 LOG = logging.getLogger(__name__)
 
@@ -96,6 +97,8 @@ class RecorderService:
             "updated_at": utc_now(),
             "session_id": recording.session_id if recording else None,
             "file": str(recording.path) if recording else None,
+            "storage": "sqlite",
+            "database": str(self.log_dir / DATABASE_FILENAME),
             "bbox": recording.bbox.as_dict() if recording else None,
             "interval_seconds": recording.interval if recording else self.default_interval,
             "snapshots": recording.snapshots if recording else 0,
@@ -163,7 +166,7 @@ class RecorderService:
         if self.recording:
             recording, self.recording = self.recording, None
             recording.close(reason)
-            LOG.info("Closed recording %s", recording.path)
+            LOG.info("Closed recording %s in %s", recording.session_id, recording.path)
 
     @staticmethod
     def _invalid_constant(value):
@@ -214,7 +217,9 @@ class RecorderService:
                 self.recording = Recording(self.log_dir, bbox, interval)
                 self.last_error = None
                 self.next_poll = max(time.monotonic(), self.retry_until)
-                LOG.info("Started recording %s", self.recording.path)
+                LOG.info(
+                    "Started recording %s in %s", self.recording.session_id, self.recording.path
+                )
             elif action == "stop":
                 self._stop_recording("command")
             elif action != "status":
@@ -232,8 +237,8 @@ class RecorderService:
         except (ValueError, UnicodeError, RecursionError) as exc:
             response = {"ok": False, "request_id": request_id, "error": str(exc)}
         except OSError:
-            self.last_error = "could not create, write, or close the recording file"
-            LOG.exception("Recording file operation failed")
+            self.last_error = "could not create, write, or close the recording database"
+            LOG.exception("Recording database operation failed")
             response = {"ok": False, "request_id": request_id, "error": self.last_error}
         if cacheable:
             self._responses[request_id] = (command, response)

@@ -1,11 +1,12 @@
-"""Append-only, flushed JSON Lines recording sessions."""
+"""Recording sessions with whole snapshots committed to SQLite."""
 
-import json
+import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
 
 from .models import BoundingBox
+from .storage import DATABASE_FILENAME, StorageError, append_record, connect_database
 
 
 def utc_now() -> str:
@@ -14,22 +15,25 @@ def utc_now() -> str:
 
 class Recording:
     def __init__(self, directory: Path, bbox: BoundingBox, interval: float):
-        directory.mkdir(parents=True, exist_ok=True)
         self.session_id = uuid4().hex
-        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
-        self.path = directory / f"{stamp}-{self.session_id}.jsonl"
+        self.path = directory / DATABASE_FILENAME
         self.bbox = bbox
         self.interval = interval
         self.started_at = utc_now()
         self.snapshots = 0
         self.aircraft_observations = 0
-        self._file = self.path.open("x", encoding="utf-8")
+        self.closed = False
+        try:
+            self._connection = connect_database(directory)
+        except sqlite3.Error as exc:
+            raise StorageError("Could not open the recording database") from exc
         try:
             self.write(
                 "start", started_at=self.started_at, bbox=bbox.as_dict(), interval_seconds=interval
             )
         except Exception:
-            self._file.close()
+            self._connection.close()
+            self.closed = True
             raise
 
     def write(self, record_type: str, **data) -> None:
@@ -40,8 +44,11 @@ class Recording:
             "recorded_at": utc_now(),
             **data,
         }
-        self._file.write(json.dumps(record, allow_nan=False, separators=(",", ":")) + "\n")
-        self._file.flush()
+        try:
+            with self._connection:
+                append_record(self._connection, record)
+        except sqlite3.Error as exc:
+            raise StorageError("Could not commit the recording database entry") from exc
 
     def snapshot(self, data: dict) -> None:
         self.write("snapshot", **data)
@@ -49,6 +56,8 @@ class Recording:
         self.aircraft_observations += len(data["states"])
 
     def close(self, reason: str) -> None:
+        if self.closed:
+            return
         try:
             self.write(
                 "stop",
@@ -57,4 +66,9 @@ class Recording:
                 aircraft_observations=self.aircraft_observations,
             )
         finally:
-            self._file.close()
+            try:
+                self._connection.close()
+            except sqlite3.Error as exc:
+                raise StorageError("Could not close the recording database") from exc
+            finally:
+                self.closed = True

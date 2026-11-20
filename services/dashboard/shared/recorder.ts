@@ -10,6 +10,8 @@ export interface RecorderStatus {
   updated_at: string
   session_id: string | null
   file: string | null
+  storage: 'sqlite'
+  database: string
   bbox: BoundingBox | null
   interval_seconds: number
   snapshots: number
@@ -60,6 +62,12 @@ export function parseBoundingBox(input: string): BoundingBox {
   }
   validateCommand({ command: 'start', bbox })
   return bbox
+}
+
+export function estimateBboxCredits(bbox: BoundingBox) {
+  const area = (bbox.lomax - bbox.lomin) * (bbox.lamax - bbox.lamin)
+  const credits = area <= 25 ? 1 : area <= 100 ? 2 : area <= 400 ? 3 : 4
+  return { area, credits }
 }
 
 function isObject(value: unknown): value is Record<string, unknown> {

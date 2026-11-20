@@ -1,6 +1,6 @@
 # ADS-B logger
 
-A self-contained Python service that records live OpenSky aircraft state snapshots to JSON Lines, controlled over MQTT. This directory owns the Python package, tests, container image, and startup script. Python 3.10+ is required for local development; Docker supplies Python in the stack.
+A self-contained Python service that records live OpenSky aircraft state snapshots to SQLite, controlled over MQTT. This directory owns the Python package, tests, container image, and startup script. Python 3.10+ is required for local development; Docker supplies Python in the stack.
 
 ## Run with Argus Stack
 
@@ -61,7 +61,7 @@ With an existing broker, use any MQTT client to publish the same JSON payloads t
 
 Every command can include an optional `request_id` (1–128 characters). The service remembers the last 128 IDs in memory: retransmitting the same command returns its original response without applying the action again. Reusing an ID for a different command is rejected. Use a new ID for each new action. This cache does not survive service restarts. While quota is blocked, every `start` is rejected, including replayed starts; quota rejections are not cached.
 
-A quota-blocked start returns `ok: false`, `error_code: "quota_exhausted"`, a readable `error`, and the current `status`. It creates no session file and makes no OpenSky request. `stop` and `status` remain available.
+A quota-blocked start returns `ok: false`, `error_code: "quota_exhausted"`, a readable `error`, and the current `status`. It creates no recording session and makes no OpenSky request. `stop` and `status` remain available.
 
 Publish commands **without retain** (do not add `mosquitto_pub -r`). Retained commands delivered when subscribing/reconnecting are ignored to prevent stale starts or stops. MQTT 3.1.1 does not expose the publisher's retain flag for messages delivered to an existing subscriber, so publishers must follow this rule.
 
@@ -69,7 +69,7 @@ Publish commands **without retain** (do not add `mosquitto_pub -r`). Retained co
 | --- | --- |
 | `adsb-logger/command` | Input JSON commands; subscribe/publish with QoS 1 |
 | `adsb-logger/response` | JSON `{ "ok": true, "request_id": "…", "status": {…} }` or `{ "ok": false, "request_id": "…", "error": "…" }`; not retained |
-| `adsb-logger/status` | Retained JSON with `state` (`idle` or `recording`), file path, session ID, bbox, interval, snapshot/observation counts, last error, retry delay, and quota fields described below |
+| `adsb-logger/status` | Retained JSON with `state` (`idle` or `recording`), database path, session ID, bbox, interval, snapshot/observation counts, last error, retry delay, and quota fields described below |
 | `adsb-logger/availability` | Retained `online`, `quota_exhausted`, or `offline` |
 
 Status updates follow commands, polls, and reconnections. Check availability before treating retained status as current. An MQTT outage does not interrupt an active recording; the client reconnects automatically and republishes current status. Commands sent while disconnected are not saved for later, and command responses are not durable. Service restarts always return to idle.
@@ -87,16 +87,22 @@ Quota fields in status:
 
 The usual `retry_after_seconds` also reports the remaining quota cooldown while blocked. Status remains `state: "idle"` after the automatic stop; quota availability and fields explain why recording is unavailable.
 
-## Output format
+## SQLite storage
 
-JSON Lines stores one independent JSON object per line. Each session contains:
+All sessions share **`LOG_DIR/adsb.sqlite3`**, which defaults to `./data/adsb.sqlite3` on the host and `/data/adsb.sqlite3` in Docker. Python's built-in SQLite module supplies the database; no extra server, container, dependency, or configuration is needed. The file is created when the first recording or import starts.
 
-1. A `start` record with session ID, bounding box, start time, and polling interval.
-2. A `snapshot` record per successful poll, including empty polls. It contains `opensky_time` (Unix seconds) and a `states` list of aircraft objects.
-3. An `error` record for failed polls, with the reason and retry delay.
-4. A `stop` record with the reason and observation counts on normal closure.
+There are two tables:
 
-Every record has `schema_version: 1`, `type`, `session_id`, and `recorded_at` (UTC ISO 8601). Records are flushed after each write, but not fsynced; abrupt termination may leave an incomplete final line and no stop record. A write failure stops the session and is reported in MQTT status and stderr.
+| Table | Stored data |
+| --- | --- |
+| `sessions` | `session_id`, start/end timestamps, `bbox_json`, interval, snapshot/observation counts, stop reason, and optional legacy `source_file` |
+| `records` | One whole event per row: ID, session ID, type, recording timestamp, OpenSky timestamp, and `payload_json` |
+
+Each successful poll is **one snapshot row containing the full aircraft list**, rather than separate rows for every aircraft. Each session still has `start`, `snapshot`, `error`, and `stop` events. `payload_json` retains `schema_version: 1`, `type`, `session_id`, `recorded_at` (UTC ISO 8601), and the same named aircraft fields previously written to JSONL.
+
+Every event is committed in a transaction. Snapshot insertion and session-counter updates are atomic. SQLite uses WAL mode with full synchronous commits, so another local connection can read committed records while capture continues. Only run one recorder against a given database. A process crash preserves committed snapshots; an unclosed session has a null `ended_at` and no final stop record. Restarting the service does not resume it.
+
+MQTT status includes `storage: "sqlite"` and `database`, even while idle. The existing `file` field points to the database while recording and is null while idle. Use `session_id` to distinguish sessions within that file. Storage failures stop recording and are reported through status and stderr.
 
 Aircraft objects use the [OpenSky field names and units](https://openskynetwork.github.io/opensky-api/rest.html#response):
 
@@ -113,18 +119,57 @@ Aircraft objects use the [OpenSky field names and units](https://openskynetwork.
 
 Unavailable values remain JSON `null`. The API is requested with `extended=1` for aircraft categories. Unexpected additional vector fields are preserved in `extra_fields`. Snapshots are saved as received, with repeated aircraft observations across polls; there is no deduplication or interpolation. These are aircraft state summaries, not raw transponder messages or flight itineraries. The service retains all returned position sources, not just source code 0 (ADS-B).
 
-For example, read snapshots in Python without loading the entire session into memory:
+List sessions with SQL:
+
+```sql
+SELECT session_id, started_at, ended_at, snapshots, aircraft_observations, stop_reason
+FROM sessions ORDER BY started_at DESC;
+```
+
+Read whole snapshots in Python without loading the entire recording into memory:
 
 ```python
 import json
+import sqlite3
+from contextlib import closing
 
-with open("data/YOUR_SESSION.jsonl") as recording:
-    for line in recording:
-        record = json.loads(line)
-        if record["type"] == "snapshot":
-            for aircraft in record["states"]:
-                print(record["opensky_time"], aircraft["icao24"], aircraft["latitude"])
+with closing(sqlite3.connect("file:data/adsb.sqlite3?mode=ro", uri=True)) as database:
+    for (payload,) in database.execute(
+        "SELECT payload_json FROM records WHERE type = 'snapshot' "
+        "AND session_id = ? ORDER BY id", ("YOUR_SESSION_ID",)
+    ):
+        snapshot = json.loads(payload)
+        for aircraft in snapshot["states"]:
+            print(snapshot["opensky_time"], aircraft["icao24"], aircraft["latitude"])
 ```
+
+### Import legacy JSONL recordings
+
+Existing JSONL files are retained. With the recorder idle, import completed sessions from the stack root:
+
+```sh
+docker compose run --rm --no-deps adsb-logger sh -c \
+  'python -m adsb_logger.migrate --log-dir /data /data/*.jsonl'
+```
+
+Imports stream one record at a time and commit each whole session atomically. Repeating the command skips session IDs already present. Invalid or incomplete files are reported and rolled back; original files are never deleted. Imported sessions preserve original timestamps, payloads, stop reasons, and counts.
+
+### Backups
+
+SQLite may keep `adsb.sqlite3-wal` and `adsb.sqlite3-shm` companion files while a connection is open. For an online backup, use SQLite's backup API rather than copying just the main file:
+
+```sh
+docker compose exec -T adsb-logger python - <<'PYTHON'
+import sqlite3
+from contextlib import closing
+
+with closing(sqlite3.connect("file:/data/adsb.sqlite3?mode=ro", uri=True)) as source:
+    with closing(sqlite3.connect("/data/adsb-backup.sqlite3")) as target:
+        source.backup(target)
+PYTHON
+```
+
+Keep the quota state file `.opensky-quota.json` alongside the database when moving deployments. It remains separate so exhausted-credit protection does not depend on opening the recording database.
 
 ## Polling and quotas
 

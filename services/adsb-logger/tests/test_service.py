@@ -30,18 +30,19 @@ def command(service, action, **kwargs):
     return json.loads([call.args[1] for call in calls if call.args[0].endswith("/response")][-1])
 
 
-def test_full_recording_lifecycle_and_new_session(service):
+def test_full_recording_lifecycle_and_new_session(service, read_records):
     assert service.status()["state"] == "idle"
     assert not service.log_dir.exists()
     reply = command(service, "start", bbox=BOX)
     assert reply["ok"]
     first_file = service.recording.path
+    first_id = service.recording.session_id
     service.poll()
     assert service.status()["snapshots"] == 1
     assert service.status()["aircraft_observations"] == 1
     assert command(service, "stop")["ok"]
     assert service.recording is None
-    records = [json.loads(line) for line in first_file.read_text().splitlines()]
+    records = read_records(first_file, first_id)
     assert [r["type"] for r in records] == ["start", "snapshot", "stop"]
     assert records[0]["bbox"] == BOX
     assert records[1]["states"] == [{"icao24": "c01234"}]
@@ -49,7 +50,8 @@ def test_full_recording_lifecycle_and_new_session(service):
     assert records[2]["reason"] == "command"
     assert len({r["session_id"] for r in records}) == 1
     assert command(service, "start", bbox=BOX, interval_seconds=60)["ok"]
-    assert service.recording.path != first_file
+    assert service.recording.path == first_file
+    assert service.recording.session_id != first_id
     assert service.recording.interval == 60
 
 
@@ -97,7 +99,7 @@ def test_request_ids_prevent_replayed_stop_affecting_new_session(service):
     assert service.recording is current
 
 
-def test_backoff_survives_stop_and_start_and_writes_error(service):
+def test_backoff_survives_stop_and_start_and_writes_error(service, read_records):
     command(service, "start", bbox=BOX)
     log = service.recording.path
     service.opensky.fetch.side_effect = OpenSkyError("rate limited", retry_after=7200)
@@ -108,7 +110,7 @@ def test_backoff_survives_stop_and_start_and_writes_error(service):
         command(service, "stop")
         command(service, "start", bbox=BOX)
         assert service.next_poll == 7300
-    records = [json.loads(line) for line in log.read_text().splitlines()]
+    records = read_records(log)
     assert records[1]["type"] == "error"
     assert records[1]["retry_after_seconds"] == 7200
 
@@ -120,7 +122,7 @@ def test_failed_write_stops_recording_and_updates_status(service):
         service.poll()
     assert service.recording is None
     assert "writing the log failed" in service.last_error
-    assert recording._file.closed
+    assert recording.closed
 
 
 def test_unwritable_directory_is_reported_as_failed_start(service):
@@ -148,18 +150,20 @@ def test_disconnected_service_keeps_recording_and_republishes_on_request(service
     assert json.loads(service.client.publish.call_args.args[1])["snapshots"] == 1
 
 
-def test_429_closes_session_blocks_new_and_replayed_starts_and_publishes_quota(service):
+def test_429_closes_session_blocks_new_and_replayed_starts_and_publishes_quota(
+    service, read_records
+):
     command(service, "start", bbox=BOX, request_id="first-start")
     recording = service.recording
     service.opensky.fetch.side_effect = OpenSkyQuotaExhausted("quota exhausted", 7200)
     service.poll()
     assert service.recording is None
-    assert recording._file.closed
+    assert recording.closed
     assert service.status()["quota_exhausted"]
     assert not service.status()["can_record"]
     assert service.status()["quota_retry_at"]
     assert service.status()["retry_after_seconds"] > 7190
-    records = [json.loads(line) for line in recording.path.read_text().splitlines()]
+    records = read_records(recording.path)
     assert [r["type"] for r in records] == ["start", "error", "stop"]
     assert records[-1]["reason"] == "quota_exhausted"
     for request_id in ("next-start", "first-start", None):
@@ -169,7 +173,7 @@ def test_429_closes_session_blocks_new_and_replayed_starts_and_publishes_quota(s
         assert result["status"]["quota_exhausted"]
         service.poll()
     service.opensky.fetch.assert_called_once()
-    assert len(list(service.log_dir.glob("*.jsonl"))) == 1
+    assert len({row["session_id"] for row in read_records(recording.path)}) == 1
     assert command(service, "status")["ok"]
     assert command(service, "stop")["ok"]
     availability = [
@@ -182,7 +186,7 @@ def test_429_closes_session_blocks_new_and_replayed_starts_and_publishes_quota(s
 @pytest.mark.parametrize(
     "box,remaining", [(BOX, 0), ({"lamin": 0, "lomin": 0, "lamax": 20, "lomax": 30}, 3)]
 )
-def test_last_successful_snapshot_is_saved_before_quota_stop(service, box, remaining):
+def test_last_successful_snapshot_is_saved_before_quota_stop(service, box, remaining, read_records):
     command(service, "start", bbox=box)
     recording = service.recording
     service.opensky.credits_remaining = remaining
@@ -190,7 +194,7 @@ def test_last_successful_snapshot_is_saved_before_quota_stop(service, box, remai
     service.poll()
     assert service.recording is None
     assert service.status()["credits_remaining"] == remaining
-    records = [json.loads(line) for line in recording.path.read_text().splitlines()]
+    records = read_records(recording.path)
     assert [r["type"] for r in records] == ["start", "snapshot", "stop"]
     assert records[-1]["reason"] == "quota_exhausted"
     assert records[-1]["snapshots"] == 1
@@ -201,7 +205,7 @@ def test_known_insufficient_balance_rejects_start_without_a_file_or_request(serv
     large_box = {"lamin": 0, "lomin": 0, "lamax": 20, "lomax": 30}
     result = command(service, "start", bbox=large_box)
     assert result["error_code"] == "quota_exhausted"
-    assert not list(service.log_dir.glob("*.jsonl"))
+    assert not (service.log_dir / "adsb.sqlite3").exists()
     service.opensky.fetch.assert_not_called()
 
 
@@ -237,7 +241,7 @@ def test_quota_lock_applies_even_if_the_final_snapshot_write_fails(service):
         service.poll()
     assert service.status()["quota_exhausted"]
     assert service.recording is None
-    assert recording._file.closed
+    assert recording.closed
 
 
 def test_service_uses_offline_last_will(service):

@@ -33,7 +33,7 @@ The Compose project is named `argus-stack`, regardless of the checkout directory
 | --- | --- | --- |
 | `mqtt` | [services/mqtt](services/mqtt/README.md) | Shared Mosquitto MQTT broker and configuration |
 | `dashboard` | [services/dashboard](services/dashboard/README.md) | Nuxt UI and server-side MQTT bridge |
-| `adsb-logger` | [services/adsb-logger](services/adsb-logger/README.md) | OpenSky polling, recording sessions, JSON Lines output |
+| `adsb-logger` | [services/adsb-logger](services/adsb-logger/README.md) | OpenSky polling, recording sessions, SQLite storage |
 
 ```text
 argus-stack/
@@ -101,11 +101,11 @@ Stop the bundled broker if it was already running. For a private CA, mount the c
 
 ### Recordings
 
-The existing root `./data` directory and any configured `LOG_DIR` are preserved. Custom host directories must already exist; a missing mount path fails early. Files are mounted at `/data` inside the recorder, so dashboard file paths refer to that location. Each session creates one `.jsonl` file containing start, snapshot, error, and stop records.
+The existing root `./data` directory and any configured `LOG_DIR` are preserved. Custom host directories must already exist; a missing mount path fails early. Files are mounted at `/data` inside the recorder, so dashboard file paths refer to that location. All sessions are stored in `LOG_DIR/adsb.sqlite3` (default `./data/adsb.sqlite3`). SQLite runs inside the recorder without a separate service. Each poll is one whole JSON snapshot entry, linked to session metadata; no new JSONL files are created. Status reports the database path and current session ID. The dashboard estimates credits per query and hourly/daily usage before capture.
 
 On Linux, set `LOGGER_UID` and `LOGGER_GID` to your user's numeric IDs if different from 1000 (`id -u`, `id -g`). The recorder prepares directory ownership before dropping privileges. It does not recursively change existing files.
 
-Recordings survive rebuilds and `docker compose down`. The recorder continues through broker outages, but process restarts return it to idle. Shutdown allows two minutes for an in-flight request and final file closure.
+The SQLite database survives rebuilds and `docker compose down`. Existing JSONL files are preserved; the [recorder guide](services/adsb-logger/README.md#import-legacy-jsonl-recordings) covers repeatable, non-destructive import and safe backups. The recorder continues through broker outages, but process restarts return it to idle. Shutdown allows two minutes for an in-flight request and final file closure.
 
 OpenSky quota exhaustion automatically closes the session, publishes `quota_exhausted` on MQTT availability, and rejects new recordings until the provider's retry time. With no retry header, the cooldown is 24 hours. A hidden `.opensky-quota.json` file in `LOG_DIR` preserves the block across restarts. Expiry allows an explicit new start; it does not poll or resume automatically. `offline` availability denotes shutdown or a broker-detected connection loss, rather than an idle recording session.
 
